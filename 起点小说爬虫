@@ -1,0 +1,467 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Nov 26 18:47:40 2017
+@title: 多线程爬取起点网所有小说简介及封面图片
+@update: 2017-11-26 21:36:38
+@author: 朱鹏鹏
+@problems_noSolved：1.程序会出现假死，直到限定时间到
+@problems_solved： 1.主线程不会等待子线程结束，一开始用的join()方法，改为自己创建hasAlive方法检测解决
+            2.程序设计不好， 为了控制BookSpider线程停止，主线程中往queue_in中加入的-1太多了，这个尤其在网速慢的情况下
+            尤为严重，因为InfoLinkSpider线程会很快结束，此时主线程开始向queue_in注入-1，而BookSpider线程会过很久才结束，
+            所以导致队列里元素过长
+            3.加入捕获错误日志功能，加入统计完成率和耗时功能
+            4.多线程环境下，即使是在获取线程锁threading.Lock的情况下仍然不好用print()内置函数，因为会输出混乱，后来采用
+            线程锁threading.Lock和自定义函数def printStr(strings):{print(strings+'\n', end='')}解决，至于为什么要改变end，
+            我认为python的内置print函数会先输出string，再输出'\n'，不具有原子性，所以要改造
+            5.利用winsound.Beep(800, 1000)加入结束提示音
+@args: 线程数(个)    主线程sleep时间(秒)    网络               任务                  耗时(秒)       失败数       总数           备注
+        32                 1            电信4G         14个主题(280MB)            119.97          0         1160
+        32                 1            电信4G         女生网，二次元(58MB)         44.37           0         -
+        32                 1         软件谷电信宽带      女生网，二次元(58MB)        317.37          13                   二次元获取失败
+        32                 1         软件谷电信宽带      14个主题(280MB)                                                 timeout：100
+        16                 1            电信4G         女生网，二次元(58MB)         46.35           0         -
+        12                 1            电信4G         女生网，二次元(58MB)         56.69           0         -
+        10                 1            电信4G         女生网，二次元(58MB)         68.55           8         -
+         8                 1            电信4G         女生网，二次元(58MB)         66.63           2         -
+"""
+
+import threading
+import time
+from bs4 import BeautifulSoup
+from lxml import etree
+import os
+import re
+import urllib
+import requests
+import queue
+import traceback
+import winsound
+
+
+
+#生产所有的信息和书籍的info页面的链接
+class InfoLinkSpider(threading.Thread):
+    def __init__(self, url, queue_in, lock, flags):
+        #继承的话，要调用父类的构造函数
+        threading.Thread.__init__(self)
+        #全局输出锁
+        self.lock = lock
+        #生产队列
+        self.queue_in = queue_in
+        #主页url
+        self.url = url
+        #同一个会话
+        self.session = requests.Session()
+        #之前遇到过一次latin-1乱码，说明不能四处粘贴代码，有可能会包含乱码
+        #设置会话的请求头
+        self.session.headers.update({
+                'Referer': 'https://www.qidian.com/',
+                'User-Agent':	'Mozilla/5.0 (Windows NT 6.3; Win64; x64; rv:57.0) Gecko/20100101 Firefox/57.0'
+                })
+        #设置爬虫停止工作的标志
+        self.flags = flags 
+        
+    def run(self):
+        #开始时间
+        startTime = time.time()
+        #得到一个字典  主题名：主题地址
+        try:
+            all_titles = self.getAllTitle()
+        except Exception as e:
+            with self.lock:
+                BookTools.printStr('网络出现故障,请检查!')
+            return
+        for title, titleUrl in all_titles.items():
+            try:
+                #获得该小说类别的排行榜地址
+                rankUrl = self.getRankUrl(titleUrl)
+                #获得所有的排行榜名字和对应的十本书的信息
+                allRanks = self.getRankBook(rankUrl)
+            except Exception as e:
+                with self.lock:
+                    BookTools.printStr('获取'+title+'的排行榜时出现错误!')
+                    BookTools.printStr(traceback.format_exc())
+                continue
+            # key:排行榜名称   lists:十本书的信息 ['10', '篮坛教皇', 'https://book.qidian.com/info/1004851718']
+            for key, lists in allRanks.items():
+                # book:一本书的三个信息
+                for book in lists:
+                    self.queue_in.put([book[2], title, key, book[0], book[1]])
+        #结束时间
+        endTime = time.time()
+        #耗时
+        needTime = endTime - startTime
+        with self.lock:
+            BookTools.printStr('所有的主题的所有排行榜的所有书的相关信息已放入生产队列\n'+'耗时:'+str(needTime)+'秒')
+        self.queue_in.put(-1)
+        
+    
+    
+    # return：字典 {小说主题：链接地址}    
+    def getAllTitle(self):
+        #会话内请求主页
+        res = self.session.get(self.url)
+        #这里设置返回的编码格式（很重要）
+        res.encoding = 'utf-8'
+        #res.text取Unicode形式文件，res.content取二进制byte文件
+        page = BeautifulSoup(res.text, 'html.parser')
+        #选择左侧所有栏目
+        eles = page.select('#classify-list dd')
+        #返回  {小说主题：地址}
+        titles = {}
+        for ele in eles:
+            #取类别网页地址
+            link = self.url + ele.select('a')[0]['href']
+            #取主题类别
+            title = ele.select('span > i')[0].string
+            #女生网是单独网址，和其他的不一样
+            if title == '女生网':
+                link = 'https:' + ele.select('a')[0]['href']
+            titles[title] = link
+        #print(titles)
+        return titles
+    
+    
+    # 参数url：小说主题链接地址
+    # return： 主题的排行榜链接地址
+    def getRankUrl(self, url):
+        res = urllib.request.urlopen(url, timeout=60)
+        page = BeautifulSoup(res.read(), 'html.parser')
+        #print(res.text)
+        #取主题类型排行榜地址
+        rank_url = page.find_all(href=re.compile('//www\.qidian\.com/rank\?chn'))
+        if not rank_url:
+            #如果没取到，说明是女生网，特别地取排行地址
+            rank_url = page.find_all(href=re.compile('//www.qidian.com/mm/rank'))
+        rank_url = 'https:' + rank_url[0]['href']
+        with self.lock:
+            BookTools.printStr('获取到该主题的url:'+url+'\n获取到全排行榜url:'+rank_url)
+        return rank_url
+    
+    
+    # 参数url：主题的排行榜链接地址
+    # return： 该主题所有排行榜的书相关信息的字典
+    def getRankBook(self, url):
+        res = urllib.request.urlopen(url, timeout=60)
+        #这里我想尝试一下lxml的xpath语法
+        page = etree.HTML(res.read())
+        #获取所有榜单
+        rankLists = page.xpath('//div[@class="rank-body"]/div/div')
+        #一个主题的所有书的字典
+        books_title = {}
+        #遍历所有榜单
+        for rankList in rankLists:
+            #获得榜单的名称
+            rank_title = ''.join(rankList.xpath('h3/text()'))
+            if not rank_title:
+                rank_title = ''.join(rankList.xpath('div/h3/text()'))
+            pattern_white = re.compile(r'\s+')
+            rank_title = re.sub(pattern_white, '', rank_title)
+            #print(rank_title)
+            #一个榜单的所有书的信息
+            books_info = []
+            #获取前十的信息
+            book_ten = rankList.xpath('div/ul/li')
+            #有三个div里还嵌套着一个class为tab-list的div，所以还要做处理
+            if not book_ten:
+                book_ten = rankList.xpath('div/div[@class="book-list"]/ul/li')
+            #遍历榜单中的十本书
+            for book in book_ten:
+                book_info = []
+                #获取书的排名
+                rank = book.xpath('@data-rid')[0]
+                #获取书的名字
+                book_name = book.xpath('div//a[not(@class) or contains(@class, "name")]/text()')
+                #有的榜单上为空所以要特殊处理
+                if not book_name:
+                    book_name = '-'
+                else:
+                    book_name = book_name[0]
+                #获取书的链接地址
+                book_address = book.xpath('div//a[not(@class) or contains(@class, "name")]/@href')
+                #有的榜单上为空所以要特殊处理
+                if not book_address:
+                    book_address = '-'
+                else:
+                    book_address = 'https:' + book_address[0]
+                #print(book_address)
+                #书籍信息中加入该书排名
+                book_info.append(rank)
+                #书籍信息中加入该书书名
+                book_info.append(book_name)
+                #书籍信息中加入该书链接地址
+                book_info.append(book_address)
+                #榜单书籍中加入该书的所有信息
+                books_info.append(book_info)
+            books_title[rank_title] = books_info
+            
+        #print(books_title)
+        return books_title
+
+
+#下载每本书的所有信息的线程爬虫
+class BookSpider(threading.Thread):
+    
+    def __init__(self, baseStoreUrl, lock, queue_in, flags, res, fails):
+        threading.Thread.__init__(self)
+        #成功数，失败数等
+        self.res = res
+        #基础存储路径
+        self.baseStoreUrl = baseStoreUrl
+        #全局输出锁
+        self.lock = lock
+        #生产队列
+        self.queue_in = queue_in
+        #设置爬虫停止工作的标志
+        self.flags = flags 
+        #放置下载失败的书籍的详细信息
+        self.fails = fails
+        #自己线程的结束标志
+        self.running = True
+        
+    def stop(self):
+        self.running = False
+    
+    def run(self):
+        while self.running:
+            #因为这个获取flag的效果不大理想， 所以我决定在InfoLinkSpider线程结束之后一直向队列里放-1
+            #当BookSpider线程取到-1时就会停止
+            #if self.queue_in.qsize() <= 0 and not self.flags[0]:
+            #    break
+            if self.queue_in.qsize() <= 0:
+                pass
+            else:
+                args = self.queue_in.get()
+                if isinstance(args, int):
+                    break
+                bookName = args[4]
+                #self.storeBookInfo(args[0], args[1], args[2], args[3], args[4])
+                try:
+                    self.storeBookInfo(args[0], args[1], args[2], args[3], args[4])
+                except Exception as e:
+                    with self.lock:
+                        self.fails.append(args)
+                        self.fails.append(traceback.format_exc())
+                        BookTools.printStr('下载《'+bookName+'》失败!')
+                        self.res[0] += 1
+                        self.res[2] += 1
+                else:
+                    with self.lock:
+                        BookTools.printStr('下载《'+bookName+'》成功!')
+                        self.res[0] += 1
+                        self.res[1] += 1
+    
+    # 参数url：书籍详细信息的链接地址
+    # 参数title：该书籍所属于的小说主题类别
+    # 参数rankName：该书籍排行榜名称
+    # 参数rankNum：该书籍在排行榜中的排名
+    # 参数bookName：该书籍的书名
+    # 存储书籍的相关信息
+    # 问题：评论和讨论数都不可获取
+    def storeBookInfo(self, url, title, rankName, rankNum, bookName):
+        if url == '-':
+            return
+        storeurl = self.baseStoreUrl+'/'+title+'/'+rankName+'/'+rankNum+'_'+bookName
+        #判断该文件是否存在，如果存在就返回
+        if os.path.exists(storeurl):
+            return
+        try:
+            response = requests.get(url, timeout=120)
+        except Exception as e:
+            raise e
+        response.encoding = 'utf-8'
+        page = etree.HTML(response.text)
+        book_info = page.xpath('//div[@class="book-information cf"]')[0]
+        #获取书名
+        #bookName = str(book_info.xpath('div[@class="book-info "]/h1/em/text()')[0])
+        #print(bookName)
+        #获取书的封面图片
+        bookPicUrl = 'https:' + str(book_info.xpath('div[@class="book-img"]/a[@id="bookImg"]/img/@src')[0])
+        #print(bookPicUrl)
+        #获取作者
+        bookWriter = str(book_info.xpath('div[@class="book-info "]/h1/span/a/text()')[0])
+        #print(bookWriter)
+        #获取小说的标签
+        bookTags = ' '.join(book_info.xpath('div[@class="book-info "]/p[@class="tag"]/*/text()'))
+        #print(bookTags)
+        #获取小说简介
+        bookIntro = book_info.xpath('div[@class="book-info "]/p[@class="intro"]/text()')
+        if bookIntro:
+            bookIntro = bookIntro[0]
+        else:
+            bookIntro = '无'
+        #print(bookIntro)
+        #获取字数，点击，推荐等信息
+        #获得数字信息
+        bookWords = book_info.xpath('div[@class="book-info "]/p[not(@class)]//em/text()')
+        #获得数字描述信息
+        bookWords_info = book_info.xpath('div[@class="book-info "]/p[not(@class)]//cite/text()')
+        #print(bookWords_info)
+        #把它们组合起来
+        bookWords = bookWords[0]+bookWords_info[0]+'，'+bookWords[1]+bookWords_info[1]+'·'+bookWords_info[2]+'，'+bookWords[2]+bookWords_info[3]+'·'+bookWords_info[4] 
+        #print(bookWords)
+        #获取小说剧情简介
+        bookBrief = '\r\n'.join(map(self.strip, page.xpath('//div[@class="book-content-wrap cf"]//div[@class="book-intro"]/p/text()')))
+        #print(bookBrief)
+        #获取该书的总章节数
+        bookChapter = page.xpath('//div[@class="content-nav-wrap cf"]//li[@class="j_catalog_block"]//span/text()')
+        if bookChapter:
+            bookChapter = bookChapter[0][1:-1]
+        else:
+            bookChapter = '未知'
+        #print(bookChapter)
+        #获取该书的总讨论数
+        bookDisCuss = page.xpath('//div[@class="content-nav-wrap cf"]//li[@class="j_discussion_block"]//span/text()')
+        if bookDisCuss:
+            #去掉括号
+            bookDisCuss = bookDisCuss[0][1:-1]
+        else:
+            bookDisCuss = '未知'
+        all_info_1 = '\t\t书名：\n'+bookName+'\n\t\t作者：\n'+bookWriter+'\n\t\t标签：\n'+bookTags+'\n\t\t简介：\n'+bookIntro
+        all_info_2 = '\n\t\t行情：\n'+bookWords+'\n\t\t剧情介绍：\n'+bookBrief+'\n\t\t总章节数：\n'+bookChapter+'\n\t\t总讨论数：\n'+bookDisCuss
+        all_info = all_info_1+all_info_2
+        BookTools.mkdir(storeurl)
+        BookTools.storeTxt(all_info, storeurl, bookName)
+        BookTools.storeImage(bookPicUrl, storeurl, bookName)
+    
+    # strip方法
+    def strip(self, strings):
+        return strings.strip()
+    
+
+class BookTools:
+    # 存储图片
+    # 参数 url：图片地址
+    # 参数 storeurl：存储文件夹
+    # 参数 bookName：书名
+    @staticmethod
+    def storeImage(url, storeurl, bookName):
+        #获取图片内容
+        response = urllib.request.urlopen(url)
+        content = response.read()
+        #图片的最终存储地址
+        path = storeurl+'/'+bookName+'.jpg'
+        if os.path.exists(path):
+            return
+        #print('正在存储该书', bookName, '的封面图片')
+        with open(path, 'wb+') as f:
+            f.write(content)
+        #print('存储该书', bookName, '的封面图片完毕!')
+    
+    # 存储书本信息
+    # 参数 info：书本信息
+    # 参数 storeurl：存储文件夹
+    # 参数 bookName：书名
+    @staticmethod
+    def storeTxt(info, storeurl, bookName):
+        #文件的最终存储地址
+        path = storeurl+'/'+bookName+'.txt'
+        if os.path.exists(path):
+            return
+        #print('正在存储该书', bookName, '的相关信息')
+        #这里要指定编码，因为有些奇怪的符号，女生嘛。。。
+        with open(path, 'w+', encoding='utf-8') as f:
+            f.write(info)
+        #print('存储该书', bookName, '的相关信息完毕!')
+    
+    # 参数 path：文件夹地址   
+    @staticmethod
+    def mkdir(path):
+        isExists = os.path.exists(path)
+        #判断该文件夹是否存在，如果不存在就创建
+        if not isExists:
+            #print('正在创建名为', path, '的文件夹')
+            os.makedirs(path)
+            #print('创建名为', path, '的文件夹完毕!')
+            
+    
+    #在多线程条件下要想规则得输出文字，不能直接同print()内置函数，
+    #需要配合线程锁threading.Lock改造成如下形式才能正确输出
+    @staticmethod
+    def printStr(strings):
+        print(strings+'\n', end='')
+        
+    #判断线程列表里的线程是不是都是活跃的
+    #为什么我不用系统的join()函数呢？因为会出问题呀，我目前不知道出现了什么问题
+    @staticmethod
+    def hasAlive(threads):
+        count = 0
+        for i in threads:
+            if i.is_alive():
+                count += 1
+        #如果有超过n个线程活着，说明可以继续运行
+        if count > 3:
+            return True
+        else:
+            return False
+            
+            
+if __name__ == '__main__':
+    #屏蔽访问https时的警告
+    requests.packages.urllib3.disable_warnings()
+    #强行停止时间,单位(秒)
+    quitTime = 800
+    #开始时间
+    startTime = time.time()
+    #全局输出锁
+    lock = threading.Lock()
+    #基础存储路径
+    baseStoreUrl = 'D:/起点小说'
+    #生产队列
+    queue_in = queue.Queue()
+    #判断爬虫结束的标志
+    flags = [True]
+    #爬取的网址主页
+    url = 'https://www.qidian.com'
+    #所有线程
+    threads = []
+    #用于统计成功和失败数目的列表， [总数， 成功数， 失败数]
+    res = [0, 0, 0]
+    #用于统计失败的书本详情
+    fails = []
+    infoLinkThread = InfoLinkSpider(url, queue_in, lock, flags)
+    infoLinkThread.start()
+    #开启数个线程用于下载小说详情
+    for i in range(32):
+        t = BookSpider(baseStoreUrl, lock, queue_in, flags, res, fails)
+        threads.append(t)
+    for i in threads:
+        i.start()
+    #只放置一次，防止由于网络原因，导致时间太长，队列里的数据太多
+    flag_1 = True
+    while(BookTools.hasAlive(threads)):
+        if flag_1 and not infoLinkThread.is_alive():
+            for i in range(2*len(threads)):
+                queue_in.put(-1)
+            flag_1 = False
+        totalTime = time.time() - startTime
+        if totalTime > quitTime:
+            break
+        time.sleep(1)
+    #只要主线程退出，就结束所有子线程
+    for i in threads:
+        #这个stop是自定义的方法，用于设置标志停止while循环
+        i.stop()
+    #等待未结束的子线程
+    time.sleep(10)
+    if res[0] == 0:
+        print('下载失败!')
+        print('耗时:{:.2f}秒'.format(totalTime))
+    else:
+        if totalTime < quitTime:
+            print('所有小说的所有详情都已下载完毕!')
+            print('耗时:{:.2f}秒'.format(totalTime))
+            print('总数:', res[0], '成功数:', res[1], '失败数:', res[2], '完成率:', '{:.4f}'.format(res[1]/res[0]))
+            print('以下为下载失败书籍的信息:')
+            for i in fails:
+                print(i)
+            print('以下可能有120秒内结束的子线程:')
+        else:
+            print('耗时:{:.2f}秒'.format(totalTime))
+            print('总数:', res[0], '成功数:', res[1], '失败数:', res[2], '完成率:', '{:.4f}'.format(res[1]/res[0]))
+            print('以下为下载失败书籍的信息:')
+            for i in fails:
+                print(i)
+            print('下载超时,所有子线程将陆续停止!')
+    #结束的系统提示音
+    winsound.Beep(800, 1000)
